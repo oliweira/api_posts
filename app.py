@@ -1,392 +1,416 @@
-# api_posts/app.py
+# app.py
 
 from flask import Flask, request, jsonify, send_from_directory
-import pymysql.cursors
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+from flask_cors import CORS
 from datetime import datetime
 import os
-from dotenv import load_dotenv
+import uuid
 from werkzeug.utils import secure_filename
-from flask_cors import CORS
 
-# --- Importações para o APScheduler ---
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.date import DateTrigger
-import atexit # Para garantir que o scheduler pare ao fechar o app
+# Importar load_dotenv
+from dotenv import load_dotenv
 
-# Carrega variáveis de ambiente do arquivo .env
+# Carregar variáveis de ambiente do .env
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
-# --- Configurações ---
-UPLOAD_FOLDER = 'uploads'
+# Adicione uma variável de configuração para a URL base do seu backend
+# Você pode pegar isso de uma variável de ambiente ou definir diretamente para desenvolvimento.
+# Para produção, você usaria o domínio real do seu backend (ex: https://api.meusite.com)
+BACKEND_BASE_URL = os.getenv('BACKEND_URL', 'http://localhost:5000') # Defina a porta do seu Flask aqui
+
+# --- Configuração do Banco de Dados MySQL usando variáveis de ambiente ---
+MYSQL_USER = os.getenv('MYSQL_USER')
+MYSQL_PASSWORD = os.getenv('MYSQL_PASSWORD')
+MYSQL_HOST = os.getenv('MYSQL_HOST')
+MYSQL_PORT = os.getenv('MYSQL_PORT')
+MYSQL_DB = os.getenv('MYSQL_DB')
+
+app.config['SQLALCHEMY_DATABASE_URI'] = (
+    f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
+)
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Configuração da pasta de uploads para posts e produtos
+UPLOAD_FOLDER_POSTS = 'uploads/posts'
+UPLOAD_FOLDER_PRODUCTS = 'uploads/products'
+app.config['UPLOAD_FOLDER_POSTS'] = UPLOAD_FOLDER_POSTS
+app.config['UPLOAD_FOLDER_PRODUCTS'] = UPLOAD_FOLDER_PRODUCTS
+
+os.makedirs(UPLOAD_FOLDER_POSTS, exist_ok=True)
+os.makedirs(UPLOAD_FOLDER_PRODUCTS, exist_ok=True)
+
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+
+# Funções auxiliares para manipulação de arquivos
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'mp4', 'mov', 'avi'}
-
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
-
-# Configurações do Banco de Dados
-DB_HOST = os.getenv('DB_HOST')
-DB_USER = os.getenv('DB_USER')
-DB_PASSWORD = os.getenv('DB_PASSWORD')
-DB_NAME = os.getenv('DB_NAME')
 
 def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def get_db_connection():
-    try:
-        connection = pymysql.connect(host=DB_HOST,
-                                     user=DB_USER,
-                                     password=DB_PASSWORD,
-                                     database=DB_NAME,
-                                     cursorclass=pymysql.cursors.DictCursor)
-        return connection
-    except Exception as e:
-        print(f"Erro ao conectar ao banco de dados: {e}")
-        return None
+def save_file(file, upload_folder):
+    if file and allowed_file(file.filename):
+        filename_base = secure_filename(file.filename)
+        unique_filename = f"{uuid.uuid4().hex}_{filename_base}"
+        filepath = os.path.join(upload_folder, unique_filename) # Caminho real no disco
+        file.save(filepath)
+        
+        # ALTERAÇÃO AQUI: Garante que o caminho para o DB e URL use sempre '/'
+        # os.path.basename(upload_folder) pega 'posts' ou 'products'
+        return f"{os.path.basename(upload_folder)}/{unique_filename}" 
+    return None
 
-# --- Funções de Publicação (MOCK - Simulação) ---
-def publish_to_instagram(post_data):
-    """Simula a publicação no Instagram."""
-    media_source = post_data.get('caminho_midia') 
-    print(f"[{datetime.now()}] PUBLICANDO NO INSTAGRAM: Legenda='{post_data['legenda']}' Mídia='{media_source}'")
-    return True 
+def delete_file(filepath_relative):
+    # ATENÇÃO: Se o filepath_relative agora virá com '/', o os.sep não funcionará diretamente para split.
+    # Você precisará usar o '/' como separador para split e join para apagar.
+    # O folder_name deve ser o primeiro elemento da string 'posts/nome_arquivo.png'
+    # O nome do arquivo real será o segundo elemento.
+    
+    # Ex: filepath_relative = 'products/5a9c0bcef5bf707474128f309e307e2_7047.png'
+    # folder_name = 'products'
+    # filename_only = '5a9c0bcef5bf707474128f309e307e2_7047.png'
+    
+    if filepath_relative:
+        parts = filepath_relative.split('/') # Usa '/' como separador, já que agora salvamos assim
+        if len(parts) < 2: # Garante que há pelo menos 'folder/filename'
+            return False # Caminho inválido para exclusão
 
-def publish_to_whatsapp(post_data):
-    """Simula a publicação no WhatsApp."""
-    media_source = post_data.get('caminho_midia')
-    print(f"[{datetime.now()}] PUBLICANDO NO WHATSAPP: Legenda='{post_data['legenda']}' Mídia='{media_source}'")
-    return True 
+        folder_name = parts[0] # 'posts' ou 'products'
+        filename_only = parts[1] # 'nome_do_arquivo.ext'
+        
+        full_path = None
+        if folder_name == 'posts':
+            full_path = os.path.join(app.config['UPLOAD_FOLDER_POSTS'], filename_only)
+        elif folder_name == 'products':
+            full_path = os.path.join(app.config['UPLOAD_FOLDER_PRODUCTS'], filename_only)
+        
+        if full_path and os.path.exists(full_path):
+            os.remove(full_path)
+            return True
+    return False
 
-# --- Função do Agendador para Processar Posts ---
-def process_scheduled_posts():
-    """
-    Verifica o banco de dados por posts agendados que já passaram da hora
-    e tenta publicá-los.
-    """
-    print(f"[{datetime.now()}] Verificando posts agendados...")
-    connection = get_db_connection()
-    if connection is None:
-        print("Não foi possível conectar ao DB para processar posts agendados.")
-        return
+# --- Modelos de Banco de Dados ---
 
-    try:
-        with connection.cursor() as cursor:
-            sql = "SELECT * FROM posts WHERE status = 'agendado' AND data_agendamento <= %s"
-            cursor.execute(sql, (datetime.now(),))
-            posts_to_publish = cursor.fetchall()
+class Post(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    legenda = db.Column(db.Text, nullable=False)
+    tipo_midia = db.Column(db.String(50), nullable=False)
+    url_midia = db.Column(db.String(255), nullable=True)
+    plataformas = db.Column(db.String(255), nullable=False)
+    data_agendamento = db.Column(db.DateTime, nullable=False)
+    status = db.Column(db.String(50), default='agendado')
+    data_publicacao = db.Column(db.DateTime, nullable=True)
 
-        for post in posts_to_publish:
-            print(f"[{datetime.now()}] Processando post ID {post['id']}: {post['legenda']}")
-            success = True
-            platforms_list = post['plataformas'].split(',')
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'legenda': self.legenda,
+            'tipo_midia': self.tipo_midia,
+            # Se a url_midia já é uma URL completa (ex: de uma API externa), não a modifique.
+            # Caso contrário, construa a URL completa baseada no caminho relativo salvo.
+            'url_midia': self.get_full_media_url(self.url_midia) if self.url_midia and not self.url_midia.startswith('http') else self.url_midia,
+            'plataformas': self.plataformas,
+            'data_agendamento': self.data_agendamento.isoformat(),
+            'status': self.status,
+            'data_publicacao': self.data_publicacao.isoformat() if self.data_publicacao else None
+        }
+    
+    def get_full_media_url(self, relative_path):
+        # ALTERAÇÃO AQUI: Simplificação, já que relative_path deve vir formatado com '/'
+        # E a rota `/uploads/<path:filename>` espera o caminho relativo completo (ex: 'posts/imagem.png')
+        if relative_path:
+            return f'{BACKEND_BASE_URL}/uploads/{relative_path}'
+        return None # Ou um placeholder para imagem/video faltando
 
-            if 'instagram' in platforms_list:
-                if not publish_to_instagram(post):
-                    success = False
-            
-            if 'whatsapp' in platforms_list:
-                if not publish_to_whatsapp(post):
-                    success = False
+class Product(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.Text, nullable=True)
+    age_classification = db.Column(db.String(50), nullable=False)
+    price = db.Column(db.Float, nullable=False)
+    quantity = db.Column(db.Integer, nullable=False)
+    media = db.relationship('ProductMedia', backref='product', lazy=True, cascade="all, delete-orphan")
 
-            new_status = 'publicado' if success else 'erro'
-            data_publicacao = datetime.now() if success else None
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'age_classification': self.age_classification,
+            'price': self.price,
+            'quantity': self.quantity,
+            'media': [m.to_dict() for m in self.media]
+        }
 
-            with connection.cursor() as cursor:
-                update_sql = "UPDATE posts SET status = %s, data_publicacao = %s WHERE id = %s"
-                cursor.execute(update_sql, (new_status, data_publicacao, post['id']))
-            connection.commit()
-            print(f"[{datetime.now()}] Post ID {post['id']} atualizado para status: {new_status}")
+class ProductMedia(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    product_id = db.Column(db.Integer, db.ForeignKey('product.id'), nullable=False)
+    url_midia = db.Column(db.String(255), nullable=False)
+    tipo_midia = db.Column(db.String(50), nullable=False)
+    filename = db.Column(db.String(255), nullable=False)
 
-    except Exception as e:
-        print(f"[{datetime.now()}] Erro geral no processamento de posts agendados: {e}")
-        connection.rollback()
-    finally:
-        connection.close()
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'product_id': self.product_id,
+            'url_midia': self.get_full_media_url(self.url_midia),
+            'tipo_midia': self.tipo_midia,
+            'filename': self.filename
+        }
+    
+    def get_full_media_url(self, relative_path):
+        # Este método já estava correto para o retorno esperado (ex: '/uploads/products/imagem.png')
+        if relative_path:
+            return f'{BACKEND_BASE_URL}/uploads/{relative_path}'
+        return None # Ou um placeholder para imagem/video faltando
 
-# --- Configuração do APScheduler ---
-scheduler = BackgroundScheduler()
-scheduler.add_job(process_scheduled_posts, 'interval', seconds=10)
+# --- Rotas para servir arquivos estáticos de uploads ---
+@app.route('/uploads/<path:filename>')
+def uploaded_file(filename):
+    # O 'filename' aqui já virá como 'posts/nome.png' ou 'products/nome.png'
+    # Os send_from_directory precisam apenas do 'nome.png' e da pasta base 'uploads/posts' ou 'uploads/products'
+    if filename.startswith('posts/'):
+        return send_from_directory(app.config['UPLOAD_FOLDER_POSTS'], filename.replace('posts/', ''))
+    elif filename.startswith('products/'):
+        return send_from_directory(app.config['UPLOAD_FOLDER_PRODUCTS'], filename.replace('products/', ''))
+    return jsonify({"message": "File not found"}), 404
 
-# --- Rotas da API ---
+# --- Rotas da API para Posts ---
+
+@app.route('/posts', methods=['GET'])
+def get_posts():
+    posts = Post.query.all()
+    return jsonify([post.to_dict() for post in posts])
+
+@app.route('/posts/<int:id>', methods=['GET'])
+def get_post(id):
+    post = Post.query.get_or_404(id)
+    return jsonify(post.to_dict())
 
 @app.route('/posts', methods=['POST'])
 def create_post():
     legenda = request.form.get('legenda')
-    tipo_midia = request.form.get('tipo_midia') 
-    plataformas = request.form.get('plataformas')
+    tipo_midia = request.form.get('tipo_midia')
+    plataformas = request.form.getlist('plataformas')
     data_agendamento_str = request.form.get('data_agendamento')
-    url_midia_form = request.form.get('url_midia') # Pega a URL do formulário (se houver)
-
-    caminho_midia_para_db = None # Variável para armazenar o valor final de 'caminho_midia' no DB
-
-    # Lida com o upload de arquivo primeiro
-    if 'media_file' in request.files and request.files['media_file'].filename != '':
-        file = request.files['media_file']
-        if allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(file_path)
-            # CORREÇÃO: Garante que o caminho no DB use forward slashes
-            caminho_midia_para_db = file_path.replace('\\', '/') 
-        else:
-            return jsonify({"message": "Tipo de arquivo não permitido"}), 400
-    elif url_midia_form: # Se nenhum arquivo, mas uma URL externa é fornecida
-        base_url_for_uploads = request.url_root + 'uploads/'
-        if url_midia_form.startswith(base_url_for_uploads):
-            # É uma URL de um arquivo local, extrai o caminho relativo
-            caminho_midia_para_db = url_midia_form[len(request.url_root):].replace('\\', '/') 
-        else:
-            # É uma URL externa, salva como está
-            caminho_midia_para_db = url_midia_form 
-    
-    # Se nem arquivo nem URL foram fornecidos, retorna erro (mídia é obrigatória)
-    if not caminho_midia_para_db and url_midia_form is None:
-         return jsonify({"message": "Mídia (arquivo ou URL) é obrigatória"}), 400
 
     if not all([legenda, tipo_midia, plataformas, data_agendamento_str]):
-        if caminho_midia_para_db and os.path.exists(caminho_midia_para_db.replace('/', os.sep)):
-            os.remove(caminho_midia_para_db.replace('/', os.sep))
-        return jsonify({"message": "Campos obrigatórios ausentes"}), 400
+        return jsonify({"message": "Dados obrigatórios faltando"}), 400
 
     try:
         data_agendamento = datetime.fromisoformat(data_agendamento_str.replace('Z', '+00:00'))
     except ValueError:
-        if caminho_midia_para_db and os.path.exists(caminho_midia_para_db.replace('/', os.sep)):
-            os.remove(caminho_midia_para_db.replace('/', os.sep))
-        return jsonify({"message": "Formato de data e hora inválido. Use ISO format (YYYY-MM-DDTHH:MM:SSZ)"}), 400
+        return jsonify({"message": "Formato de data e hora inválido"}), 400
 
-    connection = get_db_connection()
-    if connection is None:
-        if caminho_midia_para_db and os.path.exists(caminho_midia_para_db.replace('/', os.sep)):
-            os.remove(caminho_midia_para_db.replace('/', os.sep))
-        return jsonify({"message": "Erro de conexão com o banco de dados"}), 500
-
-    try:
-        with connection.cursor() as cursor:
-            sql = """INSERT INTO posts (legenda, caminho_midia, tipo_midia, plataformas, data_agendamento)
-                     VALUES (%s, %s, %s, %s, %s)"""
-            cursor.execute(sql, (legenda, caminho_midia_para_db, tipo_midia, plataformas, data_agendamento))
-        connection.commit()
-        return jsonify({"message": "Post criado com sucesso!", "id": cursor.lastrowid}), 201
-    except Exception as e:
-        connection.rollback()
-        if caminho_midia_para_db and os.path.exists(caminho_midia_para_db.replace('/', os.sep)):
-            os.remove(caminho_midia_para_db.replace('/', os.sep))
-        print(f"Erro ao inserir post no banco: {e}")
-        return jsonify({"message": "Erro ao criar post", "error": str(e)}), 500
-    finally:
-        connection.close()
-
-@app.route('/posts', methods=['GET'])
-def get_posts():
-    connection = get_db_connection()
-    if connection is None:
-        return jsonify({"message": "Erro de conexão com o banco de dados"}), 500
-
-    try:
-        with connection.cursor() as cursor:
-            sql = "SELECT * FROM posts ORDER BY data_agendamento DESC"
-            cursor.execute(sql)
-            posts = cursor.fetchall()
-            
-            for post in posts:
-                # Gera 'url_midia' dinamicamente para o frontend
-                if post['caminho_midia']:
-                    # Normalize o caminho do DB para o formato do sistema de arquivos para o os.path.exists
-                    local_path_normalized_for_os = post['caminho_midia'].replace('/', os.sep)
-                    if os.path.exists(local_path_normalized_for_os):
-                        filename_only = os.path.basename(post['caminho_midia']) # Usa o original do DB, que já está '/'
-                        post['url_midia'] = request.url_root + 'uploads/' + filename_only
-                    else:
-                        post['url_midia'] = post['caminho_midia']
-                else:
-                    post['url_midia'] = None
-                
-        return jsonify(posts), 200
-    except Exception as e:
-        print(f"Erro ao buscar posts no banco: {e}")
-        return jsonify({"message": "Erro ao buscar posts", "error": str(e)}), 500
-    finally:
-        connection.close()
-
-@app.route('/uploads/<filename>')
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
-@app.route('/posts/<int:post_id>', methods=['PUT'])
-def update_post(post_id):
-    connection = get_db_connection()
-    if connection is None:
-        return jsonify({"message": "Erro de conexão com o banco de dados"}), 500
-
-    try:
-        with connection.cursor() as cursor:
-            sql_select = "SELECT * FROM posts WHERE id = %s"
-            cursor.execute(sql_select, (post_id,))
-            post = cursor.fetchone()
-            if not post:
-                return jsonify({"message": "Post não encontrado"}), 404
-
-            legenda = request.form.get('legenda')
-            tipo_midia = request.form.get('tipo_midia')
-            plataformas = request.form.get('plataformas')
-            data_agendamento_str = request.form.get('data_agendamento')
-            url_midia_form = request.form.get('url_midia') # URL vinda do frontend (pode ser vazia ou completa)
-
-            if not all([legenda, tipo_midia, plataformas, data_agendamento_str]):
-                return jsonify({"message": "Campos obrigatórios ausentes"}), 400
-
-            try:
-                data_agendamento = datetime.fromisoformat(data_agendamento_str.replace('Z', '+00:00'))
-            except ValueError:
-                return jsonify({"message": "Formato de data e hora inválido. Use ISO format (YYYY-MM-DDTHH:MM:SSZ)"}), 400
-
-            new_caminho_midia = post['caminho_midia'] # Começa com o valor atual do banco de dados
-
-            is_file_uploaded = 'media_file' in request.files and request.files['media_file'].filename != ''
-            is_url_field_sent_by_frontend = 'url_midia' in request.form 
-            
-            # Flag para controlar a exclusão do arquivo local antigo
-            delete_old_local_file = False
-
-            if is_file_uploaded:
-                media_file = request.files['media_file']
-                if allowed_file(media_file.filename):
-                    # Um novo arquivo foi enviado, então sempre planejar a exclusão do antigo se ele existia e era local
-                    delete_old_local_file = True 
-                    filename = secure_filename(media_file.filename)
-                    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-                    media_file.save(filepath)
-                    # CORREÇÃO: Garante que o caminho no DB use forward slashes
-                    new_caminho_midia = filepath.replace('\\', '/') 
-                else:
-                    return jsonify({"message": "Tipo de arquivo não permitido"}), 400
-            elif is_url_field_sent_by_frontend:
-                # O campo 'url_midia' foi enviado do frontend (pode estar vazio ou com uma URL)
-                if url_midia_form == '':
-                    # Usuário explicitamente limpou o campo de URL
-                    new_caminho_midia = None # Define 'caminho_midia' como NULL no DB
-                    delete_old_local_file = True # Se o antigo era local, deve ser excluído
-                else:
-                    # Usuário forneceu uma string de URL (pode ser a URL de um arquivo local existente ou uma nova URL externa)
-                    base_url_for_uploads = request.url_root + 'uploads/'
-                    if url_midia_form.startswith(base_url_for_uploads):
-                        # É uma URL para um dos nossos próprios arquivos enviados (ex: http://.../uploads/arquivo.jpg)
-                        # Extrai apenas a parte relativa "uploads/arquivo.jpg" para salvar no DB
-                        # CORREÇÃO: Garante que o caminho extraído use forward slashes
-                        extracted_relative_path = url_midia_form[len(request.url_root):].replace('\\', '/')
-                        
-                        # Normalize o caminho antigo para comparação
-                        normalized_old_caminho_midia = post['caminho_midia'].replace('\\', '/') if post['caminho_midia'] else None
-
-                        # Verifica se o caminho antigo (se local) é diferente do novo caminho relativo extraído
-                        # E se o antigo caminho realmente existe no sistema de arquivos
-                        if normalized_old_caminho_midia and os.path.exists(normalized_old_caminho_midia.replace('/', os.sep)) and normalized_old_caminho_midia != extracted_relative_path:
-                            delete_old_local_file = True # Se for diferente, planeja a exclusão do antigo
-                        
-                        new_caminho_midia = extracted_relative_path # Salva "uploads/nome.ext"
-                    else:
-                        # É uma URL externa (ou alguma outra string que não aponta para nossos uploads)
-                        new_caminho_midia = url_midia_form
-                        # Se o antigo era um arquivo local, mas estamos mudando para uma URL externa, exclui o antigo
-                        if post['caminho_midia'] and os.path.exists(post['caminho_midia'].replace('/', os.sep)):
-                            delete_old_local_file = True 
-            
-            # --- Executa a exclusão do arquivo local antigo, se a flag estiver ativada ---
-            # CORREÇÃO: Normaliza o caminho do DB para o formato do sistema de arquivos antes de verificar a existência e excluir
-            if delete_old_local_file and post['caminho_midia']:
-                local_path_to_delete = post['caminho_midia'].replace('/', os.sep)
-                if os.path.exists(local_path_to_delete):
-                    os.remove(local_path_to_delete)
-                    print(f"Antigo arquivo de mídia '{post['caminho_midia']}' excluído do servidor.")
-
-            # --- Agora atualiza o banco de dados ---
-            sql_update = """
-                UPDATE posts SET
-                legenda = %s,
-                caminho_midia = %s, # Agora armazenará o caminho relativo correto ou a URL externa
-                tipo_midia = %s,
-                plataformas = %s,
-                data_agendamento = %s
-                WHERE id = %s
-            """
-            cursor.execute(sql_update, (
-                legenda,
-                new_caminho_midia,
-                tipo_midia,
-                plataformas,
-                data_agendamento,
-                post_id
-            ))
-            connection.commit()
-
-            # Busca o post atualizado para retornar a resposta e prepara 'url_midia' para o frontend
-            cursor.execute(sql_select, (post_id,))
-            updated_post_data = cursor.fetchone()
-
-            # Gera 'url_midia' dinamicamente para o frontend na resposta
-            if updated_post_data['caminho_midia']:
-                # Normaliza o caminho do DB para o formato do sistema de arquivos para o os.path.exists
-                local_path_normalized_for_os = updated_post_data['caminho_midia'].replace('/', os.sep)
-                if os.path.exists(local_path_normalized_for_os):
-                    filename_only = os.path.basename(updated_post_data['caminho_midia'])
-                    updated_post_data['url_midia'] = request.url_root + 'uploads/' + filename_only
-                else:
-                    updated_post_data['url_midia'] = updated_post_data['caminho_midia']
+    url_midia = None
+    if 'media_file' in request.files:
+        file = request.files['media_file']
+        if file.filename != '':
+            relative_filepath = save_file(file, app.config['UPLOAD_FOLDER_POSTS'])
+            if relative_filepath:
+                url_midia = relative_filepath 
             else:
-                updated_post_data['url_midia'] = None
+                return jsonify({"message": "Tipo de arquivo de mídia não permitido"}), 400
+    elif request.form.get('url_midia'):
+        url_midia = request.form.get('url_midia')
 
-            return jsonify({"message": "Post atualizado com sucesso!", "post": updated_post_data}), 200
+    new_post = Post(
+        legenda=legenda,
+        tipo_midia=tipo_midia,
+        url_midia=url_midia,
+        plataformas=','.join(plataformas),
+        data_agendamento=data_agendamento,
+        status='agendado'
+    )
+    db.session.add(new_post)
+    db.session.commit()
+    return jsonify(new_post.to_dict()), 201
 
-    except Exception as e:
-        connection.rollback()
-        print(f"Erro ao atualizar post no banco: {e}")
-        return jsonify({"message": "Erro ao atualizar post", "error": str(e)}), 500
-    finally:
-        connection.close()
+@app.route('/posts/<int:id>', methods=['PUT'])
+def update_post(id):
+    post = Post.query.get_or_404(id)
 
-@app.route('/posts/<int:post_id>', methods=['DELETE'])
-def delete_post(post_id):
-    connection = get_db_connection()
-    if connection is None:
-        return jsonify({"message": "Erro de conexão com o banco de dados"}), 500
+    legenda = request.form.get('legenda')
+    tipo_midia = request.form.get('tipo_midia')
+    plataformas = request.form.getlist('plataformas')
+    data_agendamento_str = request.form.get('data_agendamento')
+
+    if not all([legenda, tipo_midia, plataformas, data_agendamento_str]):
+        return jsonify({"message": "Dados obrigatórios faltando"}), 400
 
     try:
-        with connection.cursor() as cursor:
-            sql_select = "SELECT caminho_midia FROM posts WHERE id = %s"
-            cursor.execute(sql_select, (post_id,))
-            post = cursor.fetchone()
+        data_agendamento = datetime.fromisoformat(data_agendamento_str.replace('Z', '+00:00'))
+    except ValueError:
+        return jsonify({"message": "Formato de data e hora inválido"}), 400
 
-            if not post:
-                return jsonify({"message": "Post não encontrado"}), 404
+    new_url_midia_form = request.form.get('url_midia')
+    existing_url_midia = post.url_midia
 
-            # CORREÇÃO: Normaliza o caminho do DB para o formato do sistema de arquivos antes de verificar a existência e excluir
-            if post['caminho_midia']:
-                local_path_to_delete = post['caminho_midia'].replace('/', os.sep)
-                if os.path.exists(local_path_to_delete):
-                    os.remove(local_path_to_delete)
-                    print(f"Arquivo de mídia '{post['caminho_midia']}' excluído do servidor.")
+    if 'media_file' in request.files and request.files['media_file'].filename != '':
+        file = request.files['media_file']
+        if existing_url_midia and not existing_url_midia.startswith('http'):
+            delete_file(existing_url_midia)
+        
+        relative_filepath = save_file(file, app.config['UPLOAD_FOLDER_POSTS'])
+        if relative_filepath:
+            post.url_midia = relative_filepath
+        else:
+            return jsonify({"message": "Tipo de arquivo de mídia não permitido"}), 400
+    elif new_url_midia_form == '':
+        if existing_url_midia and not existing_url_midia.startswith('http'):
+            delete_file(existing_url_midia)
+        post.url_midia = None
+    elif new_url_midia_form and new_url_midia_form != existing_url_midia:
+        if existing_url_midia and not existing_url_midia.startswith('http') and existing_url_midia != new_url_midia_form:
+            delete_file(existing_url_midia)
+        post.url_midia = new_url_midia_form
 
-            sql_delete = "DELETE FROM posts WHERE id = %s"
-            cursor.execute(sql_delete, (post_id,))
-        connection.commit()
-        return jsonify({"message": "Post excluído com sucesso"}), 200
-    except Exception as e:
-        connection.rollback()
-        print(f"Erro ao excluir post: {e}")
-        return jsonify({"message": "Erro ao excluir post", "error": str(e)}), 500
-    finally:
-        connection.close()
+    post.legenda = legenda
+    post.tipo_midia = tipo_midia
+    post.plataformas = ','.join(plataformas)
+    post.data_agendamento = data_agendamento
 
-# --- Execução do Servidor Flask ---
+    db.session.commit()
+    return jsonify(post.to_dict())
+
+@app.route('/posts/<int:id>', methods=['DELETE'])
+def delete_post(id):
+    post = Post.query.get_or_404(id)
+    if post.url_midia and not post.url_midia.startswith('http'):
+        delete_file(post.url_midia)
+    db.session.delete(post)
+    db.session.commit()
+    return jsonify({"message": "Post excluído com sucesso"})
+
+# --- Rotas da API para Produtos ---
+
+@app.route('/products', methods=['GET'])
+def get_products():
+    products = Product.query.all()
+    return jsonify([p.to_dict() for p in products])
+
+@app.route('/products/<int:id>', methods=['GET'])
+def get_product(id):
+    product = Product.query.get_or_404(id)
+    return jsonify(product.to_dict())
+
+@app.route('/products', methods=['POST'])
+def create_product():
+    name = request.form.get('name')
+    description = request.form.get('description', None)
+    age_classification = request.form.get('age_classification')
+    price = request.form.get('price')
+    quantity = request.form.get('quantity')
+
+    if not all([name, age_classification, price is not None, quantity is not None]):
+        return jsonify({"message": "Dados obrigatórios faltando"}), 400
+
+    try:
+        price = float(price)
+        quantity = int(quantity)
+    except ValueError:
+        return jsonify({"message": "Preço ou quantidade inválidos"}), 400
+
+    new_product = Product(
+        name=name,
+        description=description,
+        age_classification=age_classification,
+        price=price,
+        quantity=quantity
+    )
+    db.session.add(new_product)
+    db.session.commit()
+
+    if 'media_files' in request.files:
+        files = request.files.getlist('media_files')
+        for file in files:
+            if file.filename == '':
+                continue
+            relative_filepath = save_file(file, app.config['UPLOAD_FOLDER_PRODUCTS'])
+            if relative_filepath:
+                new_media = ProductMedia(
+                    product_id=new_product.id,
+                    url_midia=relative_filepath,
+                    tipo_midia='imagem' if file.mimetype.startswith('image/') else 'video',
+                    filename=secure_filename(file.filename)
+                )
+                db.session.add(new_media)
+            else:
+                print(f"Tipo de arquivo não permitido para: {file.filename}")
+    db.session.commit()
+    return jsonify(new_product.to_dict()), 201
+
+@app.route('/products/<int:id>', methods=['PUT'])
+def update_product(id):
+    product = Product.query.get_or_404(id)
+
+    name = request.form.get('name', product.name)
+    description = request.form.get('description', product.description)
+    age_classification = request.form.get('age_classification', product.age_classification)
+    price_str = request.form.get('price', str(product.price))
+    quantity_str = request.form.get('quantity', str(product.quantity))
+
+    try:
+        price = float(price_str)
+        quantity = int(quantity_str)
+    except ValueError:
+        return jsonify({"message": "Preço ou quantidade inválidos"}), 400
+
+    product.name = name
+    product.description = description
+    product.age_classification = age_classification
+    product.price = price
+    product.quantity = quantity
+
+    if 'media_files' in request.files:
+        files = request.files.getlist('media_files')
+        for file in files:
+            if file.filename == '':
+                continue
+            relative_filepath = save_file(file, app.config['UPLOAD_FOLDER_PRODUCTS'])
+            if relative_filepath:
+                new_media = ProductMedia(
+                    product_id=product.id,
+                    url_midia=relative_filepath,
+                    tipo_midia='imagem' if file.mimetype.startswith('image/') else 'video',
+                    filename=secure_filename(file.filename)
+                )
+                db.session.add(new_media)
+            else:
+                print(f"Tipo de arquivo não permitido para: {file.filename}")
+
+    db.session.commit()
+    return jsonify(product.to_dict())
+
+@app.route('/products/<int:product_id>/media/<int:media_id>', methods=['DELETE'])
+def delete_product_media(product_id, media_id):
+    media = ProductMedia.query.filter_by(id=media_id, product_id=product_id).first_or_404()
+    
+    if media.url_midia:
+        delete_file(media.url_midia)
+    
+    db.session.delete(media)
+    db.session.commit()
+    return jsonify({"message": "Mídia do produto excluída com sucesso"}), 200
+
+@app.route('/products/<int:id>', methods=['DELETE'])
+def delete_product(id):
+    product = Product.query.get_or_404(id)
+    for media_item in product.media:
+        delete_file(media_item.url_midia)
+
+    db.session.delete(product)
+    db.session.commit()
+    return jsonify({"message": "Produto e suas mídias excluídos com sucesso"}), 200
+
 if __name__ == '__main__':
-    scheduler.start()
-    print("Scheduler iniciado.")
-    atexit.register(lambda: scheduler.shutdown())
-    app.run(debug=True, port=5000)
+    with app.app_context():
+        pass # Migrações cuidam da criação das tabelas
+
+    app.run(debug=True)
